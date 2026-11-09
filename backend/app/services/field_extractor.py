@@ -1,11 +1,17 @@
-
 import re
+from typing import Optional
 
 
 def result(value=None, confidence=0.0):
+    """Return a consistent extraction result."""
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            value = None
+
     return {
-        "value": value.strip() if isinstance(value, str) else value,
-        "confidence": confidence
+        "value": value,
+        "confidence": confidence if value is not None else 0.0
     }
 
 
@@ -13,66 +19,84 @@ def normalize_label(label: str) -> str:
     return re.sub(r"[^a-z0-9]", "", label.lower())
 
 
+def _non_empty_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _label_regex(label: str) -> str:
+    """
+    Build a label expression that tolerates repeated spaces and punctuation
+    while still matching the label literally.
+    """
+    parts = re.split(r"\s+", label.strip().rstrip("."))
+    return r"\s+".join(re.escape(part) for part in parts)
+
+
 def extract_labeled_value(text: str, labels: list[str]):
     """
-    Supports:
-    Label: Value
-    Label | Value
-    Label - Value
-    Label = Value
-    Label # Value
-    Label    Value
-    Label
-    Value on next line
-    """
+    Extract a value from common label formats:
+      Label: Value
+      Label | Value
+      Label - Value
+      Label = Value
+      Label # Value
+      Label    Value
+      Label
+      Value on the next line
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    The label must start the line, reducing accidental matches inside
+    unrelated sentences.
+    """
+    lines = _non_empty_lines(text)
 
     for label in sorted(labels, key=len, reverse=True):
-        escaped = re.escape(label.rstrip("."))
+        label_pattern = _label_regex(label)
 
-        pattern = (
-            rf"^\s*{escaped}\.?"
+        same_line_pattern = re.compile(
+            rf"^\s*{label_pattern}\.?"
             rf"(?:[ \t]*[:#|=][ \t]*|[ \t]+-[ \t]*|[ \t]{{2,}})"
-            rf"(.+?)\s*$"
+            rf"(.+?)\s*$",
+            re.IGNORECASE
+        )
+        standalone_pattern = re.compile(
+            rf"^\s*{label_pattern}\.?\s*$",
+            re.IGNORECASE
         )
 
-        standalone_pattern = rf"^\s*{escaped}\.?\s*$"
-
         for index, line in enumerate(lines):
-            match = re.search(pattern, line, re.IGNORECASE)
-
+            match = same_line_pattern.match(line)
             if match:
                 value = match.group(1).strip()
                 if value:
                     return result(value, 0.95)
 
-            if re.match(standalone_pattern, line, re.IGNORECASE):
-                if index + 1 < len(lines):
-                    next_line = lines[index + 1]
+            if standalone_pattern.match(line) and index + 1 < len(lines):
+                next_line = lines[index + 1].strip()
 
-                    if not re.match(r"^[A-Z][A-Z /&]{2,}$", next_line):
-                        return result(next_line, 0.85)
+                # Avoid treating the next section heading as a field value.
+                if not re.match(
+                    r"^[A-Z][A-Z /&()_-]{2,}$",
+                    next_line
+                ):
+                    return result(next_line, 0.85)
 
     return result()
 
 
 def extract_combined_value(text: str, first_label: str, next_labels: list[str]):
     """
-    Extracts a value from lines containing multiple labelled fields.
+    Extract one value from a line containing multiple labelled fields.
     Example: Gross Wt: 585 kg Net Wt: 530 kg
     """
+    lookahead = "|".join(re.escape(label) for label in next_labels)
 
     pattern = (
-        rf"{re.escape(first_label)}\s*[:#|=]?\s*"
+        rf"{re.escape(first_label)}\s*[:#|=.-]?\s*"
         rf"(.+?)"
+        rf"(?=\s+(?:{lookahead})\b|$)"
     )
 
-    for next_label in next_labels:
-        pattern += rf"(?=\s+{re.escape(next_label)}\b|$)"
-
     match = re.search(pattern, text, re.IGNORECASE)
-
     if match:
         return result(match.group(1).strip(), 0.95)
 
@@ -84,7 +108,6 @@ def clean_unit_price(value):
         return value
 
     match = re.search(r"\d[\d,]*(?:\.\d+)?", value)
-
     if match:
         return match.group(0).replace(",", "")
 
@@ -93,11 +116,9 @@ def clean_unit_price(value):
 
 def extract_invoice_table_fields(text: str):
     """
-    Extracts product information from invoice table rows.
-    Example:
-    1 Brake Pad Sets 87083010 500 | SETS 12.50 6,250.00
+    Extract product information from invoice table rows.
+    Retains support for the table format handled by the original parser.
     """
-
     products = []
     total_quantity = None
     unit_prices = []
@@ -114,15 +135,15 @@ def extract_invoice_table_fields(text: str):
         )
 
         if match:
+            unit_price = match.group(4).replace(",", "")
             products.append({
                 "description": match.group(1).strip(),
                 "hsn_code": match.group(2),
                 "quantity": match.group(3).replace(",", ""),
-                "unit_price": match.group(4).replace(",", ""),
+                "unit_price": unit_price,
                 "amount": match.group(5).replace(",", "")
             })
-
-            unit_prices.append(match.group(4).replace(",", ""))
+            unit_prices.append(unit_price)
 
     total_match = re.search(
         r"(?im)^\s*TOTAL CIF [A-Z ]+\s+([\d,]+)\s+([\d,.]+)",
@@ -136,11 +157,6 @@ def extract_invoice_table_fields(text: str):
 
 
 def extract_total_quantity(text: str):
-    """
-    Extracts total quantity from a table total row.
-    Example: TOTAL 35 3,800 530.00 585.00
-    """
-
     patterns = [
         r"(?im)^\s*TOTAL(?:\s+CIF\s+[A-Z ]+)?\s+[\d,]+\s+([\d,]+)\s+",
         r"(?im)^\s*TOTAL\s+QUANTITY\s*[:#|=]?\s*([\d,]+)"
@@ -148,7 +164,6 @@ def extract_total_quantity(text: str):
 
     for pattern in patterns:
         match = re.search(pattern, text)
-
         if match:
             return result(match.group(1).replace(",", ""), 0.90)
 
@@ -157,22 +172,14 @@ def extract_total_quantity(text: str):
 
 def extract_total_weight(text: str, weight_type: str):
     """
-    Extracts gross or net weight using different label formats.
-
-    Examples:
-    Gross Weight: 585 kg
-    Gross Wt: 585 kg
-    G.W.: 585 kg
-    GW: 585 kg
-    Net Weight: 530 kg
-    N.W.: 530 kg
-    NW: 530 kg
+    Extract gross or net weight from common labels, including:
+    Gross Weight, Gross Wt, G.W., GW, Net Weight, Net Wt, N.W., NW.
     """
-
     if weight_type.lower() == "gross":
         labels = [
             "Shipment Gross Weight",
             "Shipment Gross Wt",
+            "Total Gross Weight",
             "Gross Weight",
             "Gross Wt.",
             "Gross Wt",
@@ -183,6 +190,9 @@ def extract_total_weight(text: str, weight_type: str):
         ]
     else:
         labels = [
+            "Shipment Net Weight",
+            "Shipment Net Wt",
+            "Total Net Weight",
             "Net Weight",
             "Net Wt.",
             "Net Wt",
@@ -194,13 +204,12 @@ def extract_total_weight(text: str, weight_type: str):
 
     for label in sorted(labels, key=len, reverse=True):
         pattern = (
-            rf"(?<![A-Za-z]){re.escape(label)}"
+            rf"(?<![A-Za-z]){_label_regex(label)}"
             rf"(?![A-Za-z])\s*[:#|=.-]?\s*"
-            rf"([\d,.]+\s*(?:kg|kgs|kilograms)?)"
+            rf"([\d,]+(?:\.\d+)?\s*(?:kg|kgs|kilograms)?)"
         )
 
         match = re.search(pattern, text, re.IGNORECASE)
-
         if match:
             return result(match.group(1).strip(), 0.95)
 
@@ -226,7 +235,6 @@ def extract_package_count(text: str):
 
     if value["value"]:
         match = re.search(r"\d[\d,]*", value["value"])
-
         if match:
             return result(
                 match.group(0).replace(",", ""),
@@ -237,15 +245,13 @@ def extract_package_count(text: str):
         r"(?im)^\s*TOTAL\s+(\d+)\s+[\d,]+\s+",
         text
     )
-
     if match:
         return result(match.group(1), 0.90)
 
     match = re.search(
-        r"(?i)(\d+)\s*(?:CTNS|CARTONS|PACKAGES)",
+        r"(?i)(\d+)\s*(?:CTNS|CARTONS|PACKAGES)\b",
         text
     )
-
     if match:
         return result(match.group(1), 0.85)
 
@@ -285,9 +291,22 @@ def extract_invoice_fields(text: str):
             r"(?im)^\s*TOTAL\s+CIF\s+[A-Z ]+\s+[\d,]+\s+([\d,]+\.\d{2})",
             text
         )
-
         if match:
             total_amount = result(match.group(1), 0.90)
+
+    unit_price = (
+        result(", ".join(unit_prices), 0.90)
+        if unit_prices
+        else extract_labeled_value(
+            text,
+            [
+                "Unit Price",
+                "Price per Unit",
+                "Unit Rate",
+                "Rate per Unit"
+            ]
+        )
+    )
 
     return {
         "invoice_number": extract_labeled_value(
@@ -385,11 +404,7 @@ def extract_invoice_fields(text: str):
             else quantity
         ),
 
-        "unit_price": (
-            result(", ".join(unit_prices), 0.90)
-            if unit_prices
-            else result()
-        ),
+        "unit_price": unit_price,
 
         "gross_weight": extract_total_weight(text, "gross"),
 
@@ -416,9 +431,8 @@ def extract_packing_table_fields(text: str):
         if match:
             products.append(match.group(1).strip())
 
-    # Example total row:
+    # Original packing-table total format:
     # TOTAL 35 3,800 530.00 585.00 | 2.14 CBM
-
     total_match = re.search(
         r"(?im)^\s*TOTAL\s+(\d+)\s+([\d,]+)\s+"
         r"([\d,.]+)\s+([\d,.]+)",
@@ -432,12 +446,10 @@ def extract_packing_table_fields(text: str):
 
     if total_match:
         packages = result(total_match.group(1), 0.95)
-
         quantity = result(
             total_match.group(2).replace(",", ""),
             0.95
         )
-
         net_weight = result(total_match.group(3), 0.95)
         gross_weight = result(total_match.group(4), 0.95)
 
@@ -463,24 +475,27 @@ def extract_packing_table_fields(text: str):
 
 
 def extract_vessel_and_voyage(text: str):
-    """Extracts vessel name and voyage number separately."""
-
+    """Extract vessel name and voyage number from combined or separate labels."""
     vessel = result()
     voyage = result()
 
-    # Example: Vessel Name: MV Ocean Star V.026E
+    # Combined example: MV Ocean Star V.026E
+    combined_patterns = [
+        r"\b(MV\s+[A-Z][A-Z0-9 .'-]*?)\s+V\.?\s*(\d+[A-Z]?)\b",
+        r"\b(M\/V\s+[A-Z][A-Z0-9 .'-]*?)\s+V\.?\s*(\d+[A-Z]?)\b"
+    ]
 
-    match = re.search(
-        r"\b(MV\s+[A-Z][A-Z ]*?)\s+V\.?\s*(\d+[A-Z]?)\b",
-        text,
-        re.IGNORECASE
-    )
+    for pattern in combined_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return (
+                result(match.group(1).strip(), 0.95),
+                result(match.group(2).strip(), 0.95)
+            )
 
-    if match:
-        vessel = result(match.group(1).strip(), 0.95)
-        voyage = result(match.group(2).strip(), 0.95)
-        return vessel, voyage
-
+    # Separate labels, as in:
+    # Vessel Name: MSC Horizon
+    # Voyage Number: V123
     vessel = extract_labeled_value(
         text,
         [
@@ -494,6 +509,7 @@ def extract_vessel_and_voyage(text: str):
         text,
         [
             "Voyage Number",
+            "Voyage No.",
             "Voyage No",
             "Voyage"
         ]
@@ -506,7 +522,6 @@ def extract_packing_list_fields(text: str):
     table = extract_packing_table_fields(text)
 
     quantity = table["quantity"]
-
     if not quantity["value"]:
         quantity = extract_labeled_value(
             text,
@@ -514,24 +529,40 @@ def extract_packing_list_fields(text: str):
                 "Total Quantity",
                 "Total Units",
                 "Total Qty",
-                "Quantity"
+                "Quantity",
+                "Qty"
             ]
         )
 
     packages = table["number_of_packages"]
-
     if not packages["value"]:
         packages = extract_package_count(text)
 
-    package_type = result()
+    # Prefer an explicitly labelled package type.
+    package_type = extract_labeled_value(
+        text,
+        [
+            "Package Type",
+            "Packing Type",
+            "Type of Packages"
+        ]
+    )
 
-    if re.search(r"\bcartons?\b", text, re.IGNORECASE):
-        package_type = result("Cartons", 0.90)
-
-    elif re.search(r"\bpackages?\b", text, re.IGNORECASE):
-        package_type = result("Packages", 0.85)
+    if not package_type["value"]:
+        if re.search(r"\bcartons?\b", text, re.IGNORECASE):
+            package_type = result("Cartons", 0.90)
+        elif re.search(r"\bpackages?\b", text, re.IGNORECASE):
+            package_type = result("Packages", 0.85)
 
     vessel, voyage = extract_vessel_and_voyage(text)
+
+    table_net_weight = table["net_weight"]
+    if not table_net_weight["value"]:
+        table_net_weight = extract_total_weight(text, "net")
+
+    table_gross_weight = table["gross_weight"]
+    if not table_gross_weight["value"]:
+        table_gross_weight = extract_total_weight(text, "gross")
 
     return {
         "product_description": (
@@ -554,9 +585,9 @@ def extract_packing_list_fields(text: str):
 
         "package_type": package_type,
 
-        "net_weight": table["net_weight"],
+        "net_weight": table_net_weight,
 
-        "gross_weight": table["gross_weight"],
+        "gross_weight": table_gross_weight,
 
         "container_number": table["container_number"],
 
@@ -579,29 +610,29 @@ def extract_packing_list_fields(text: str):
 
 def extract_heading_value(text: str, labels: list[str]):
     """
-    Extracts a value from the line immediately below a heading.
-    Useful for B/L layouts where SHIPPER and CONSIGNEE
-    appear on separate lines from their values.
+    Extract a value from the line immediately below a standalone heading.
+    Useful for document layouts where a heading and its value are on
+    separate lines.
     """
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = _non_empty_lines(text)
 
     for label in labels:
-        pattern = rf"^\s*{re.escape(label)}\s*:?\s*$"
+        pattern = re.compile(
+            rf"^\s*{_label_regex(label)}\s*:?\s*$",
+            re.IGNORECASE
+        )
 
         for index, line in enumerate(lines):
-            if re.match(pattern, line, re.IGNORECASE):
+            if pattern.match(line) and index + 1 < len(lines):
+                next_line = lines[index + 1].strip()
 
-                if index + 1 < len(lines):
-                    next_line = lines[index + 1].strip()
-
-                    if next_line and not re.match(
-                        r"^(SHIPPER|CONSIGNEE|NOTIFY PARTY|"
-                        r"VESSEL|VOYAGE|DESCRIPTION OF GOODS)\s*:?\s*$",
-                        next_line,
-                        re.IGNORECASE
-                    ):
-                        return result(next_line, 0.90)
+                if next_line and not re.match(
+                    r"^(SHIPPER|CONSIGNEE|NOTIFY PARTY|"
+                    r"VESSEL|VOYAGE|DESCRIPTION OF GOODS)\s*:?\s*$",
+                    next_line,
+                    re.IGNORECASE
+                ):
+                    return result(next_line, 0.90)
 
     return result()
 
@@ -611,7 +642,6 @@ def extract_bl_container_and_seal(text: str):
     Handles combined fields such as:
     Container / Seal Nos: MSKU1234567 / SL884512
     """
-
     match = re.search(
         r"(?i)Container\s*/\s*Seal\s+Nos?\.?\s*[:#]?\s*"
         r"([A-Z]{4}\d{7})\s*/\s*([A-Z0-9-]+)",
@@ -628,46 +658,34 @@ def extract_bl_container_and_seal(text: str):
 
 
 def extract_bl_weight(text: str):
-    match = re.search(
-        r"(?i)Gross\s*(?:Wt|Weight)\s*[:#]?\s*"
-        r"([\d,.]+)\s*(kg|kgs|kilograms)?",
-        text
-    )
-
-    if match:
-        value = match.group(1)
-
-        if match.group(2):
-            value += " " + match.group(2)
-
-        return result(value, 0.95)
-
-    return result()
+    # Reuse the general gross-weight extractor.
+    return extract_total_weight(text, "gross")
 
 
 def extract_bl_measurement(text: str):
     match = re.search(
-        r"(?i)Measurement\s*[:#]?\s*"
-        r"([\d,.]+)\s*(CBM|M3|M³)?",
+        r"(?i)Measurement\s*[:#|=.-]?\s*"
+        r"([\d,]+(?:\.\d+)?)\s*(CBM|M3|M³)?",
         text
     )
 
     if match:
         value = match.group(1)
-
         if match.group(2):
             value += " " + match.group(2)
-
         return result(value, 0.95)
 
     return result()
 
 
 def extract_bl_fields(text: str):
-    # Normalize whitespace while preserving the original text.
+    """
+    Extract fields from both simple labelled B/L documents and the
+    older tabular B/L layout supported by the original implementation.
+    """
     normalized = re.sub(r"[ \t]+", " ", text)
 
-    # 1. B/L number
+    # 1. Bill of Lading Number
     bl_number = extract_labeled_value(
         normalized,
         [
@@ -683,149 +701,202 @@ def extract_bl_fields(text: str):
     )
 
     # 2. Shipper
-    shipper_match = re.search(
-        r"SHIPPER\s+BOOKING\s*/\s*REFERENCE\s+"
-        r"(.+?)\s+Booking\s+No\s*:",
+    shipper = extract_labeled_value(
         normalized,
-        re.IGNORECASE | re.DOTALL
+        [
+            "Shipper",
+            "Exporter"
+        ]
     )
 
-    shipper = (
-        result(shipper_match.group(1).strip(), 0.90)
-        if shipper_match
-        else result()
-    )
+    if not shipper["value"]:
+        # Fallback for the older SHIPPER / BOOKING / REFERENCE layout.
+        shipper_match = re.search(
+            r"SHIPPER\s+BOOKING\s*/\s*REFERENCE\s+"
+            r"(.+?)\s+Booking\s+No\s*:",
+            normalized,
+            re.IGNORECASE | re.DOTALL
+        )
+        if shipper_match:
+            shipper = result(shipper_match.group(1).strip(), 0.90)
 
     # 3. Consignee and Notify Party
-    consignee = result()
-    notify_party = result()
-
-    party_match = re.search(
-        r"CONSIGNEE\s+NOTIFY PARTY\s+"
-        r"(.+?)\s+Industriestrasse",
+    consignee = extract_labeled_value(
         normalized,
-        re.IGNORECASE | re.DOTALL
+        [
+            "Consignee",
+            "Receiver"
+        ]
     )
 
-    if party_match:
-        party_text = party_match.group(1).strip()
+    notify_party = extract_labeled_value(
+        normalized,
+        [
+            "Notify Party",
+            "Notify"
+        ]
+    )
 
-        company_matches = re.findall(
-            r"([A-Z][A-Za-z0-9&.,' -]*?"
-            r"(?:GmbH|Pvt\.?\s*Ltd\.?|Limited|Ltd\.?|Inc\.?))",
-            party_text
+    # Fallback for the older B/L layout.
+    if not consignee["value"] or not notify_party["value"]:
+        party_match = re.search(
+            r"CONSIGNEE\s+NOTIFY PARTY\s+"
+            r"(.+?)\s+Industriestrasse",
+            normalized,
+            re.IGNORECASE | re.DOTALL
         )
 
-        if len(company_matches) >= 2:
-            consignee = result(company_matches[0].strip(), 0.90)
-            notify_party = result(company_matches[1].strip(), 0.90)
+        if party_match:
+            party_text = party_match.group(1).strip()
+            company_matches = re.findall(
+                r"([A-Z][A-Za-z0-9&.,' -]*?"
+                r"(?:GmbH|Pvt\.?\s*Ltd\.?|Limited|Ltd\.?|Inc\.?))",
+                party_text
+            )
 
-        elif len(company_matches) == 1:
-            consignee = result(company_matches[0].strip(), 0.90)
-            notify_party = result(company_matches[0].strip(), 0.85)
+            if not consignee["value"] and company_matches:
+                consignee = result(company_matches[0].strip(), 0.90)
+
+            if not notify_party["value"] and len(company_matches) >= 2:
+                notify_party = result(company_matches[1].strip(), 0.90)
 
     # 4. Vessel and voyage
-    vessel_match = re.search(
-        r"\b(MV\s+[A-Z][A-Z ]+?)\s+V\.?\s*(\d+[A-Z]?)",
-        normalized,
-        re.IGNORECASE
-    )
+    vessel, voyage = extract_vessel_and_voyage(normalized)
 
-    vessel = result()
-    voyage = result()
+    # Fallback for the older combined MV ... V123 format.
+    if not vessel["value"] or not voyage["value"]:
+        vessel_match = re.search(
+            r"\b(MV\s+[A-Z][A-Z ]+?)\s+V\.?\s*(\d+[A-Z]?)",
+            normalized,
+            re.IGNORECASE
+        )
 
-    if vessel_match:
-        vessel = result(vessel_match.group(1).strip(), 0.95)
-        voyage = result(vessel_match.group(2).strip(), 0.95)
+        if vessel_match:
+            if not vessel["value"]:
+                vessel = result(vessel_match.group(1).strip(), 0.95)
+            if not voyage["value"]:
+                voyage = result(vessel_match.group(2).strip(), 0.95)
 
     # 5. Container and seal numbers
-    container_match = re.search(
-        r"\b([A-Z]{4}\d{7})\s*/\s*([A-Z0-9-]+)\b",
-        normalized
+    container = extract_labeled_value(
+        normalized,
+        [
+            "Container Number",
+            "Container No.",
+            "Container No",
+            "Container #",
+            "Container ID"
+        ]
     )
 
-    container = result()
-    seal = result()
-
-    if container_match:
-        container = result(container_match.group(1), 0.95)
-        seal = result(container_match.group(2), 0.95)
-
-    # 6. Gross weight and measurement from the cargo table
-    weight_match = re.search(
-        r"(\d{2,3}(?:,\d{3})*(?:\.\d+)?)\s+"
-        r"(\d+\.\d+)\s*(?:\n|$)",
-        text
+    seal = extract_labeled_value(
+        normalized,
+        [
+            "Seal Number",
+            "Seal No.",
+            "Seal No",
+            "Seal #"
+        ]
     )
 
-    gross_weight = result()
-    measurement = result()
-
-    if weight_match:
-        gross_weight = result(
-            weight_match.group(1) + " kg",
-            0.90
+    # Support the combined Container / Seal Nos format.
+    if not container["value"] or not seal["value"]:
+        combined_container, combined_seal = extract_bl_container_and_seal(
+            normalized
         )
 
-        measurement = result(
-            weight_match.group(2) + " CBM",
-            0.90
+        if not container["value"]:
+            container = combined_container
+        if not seal["value"]:
+            seal = combined_seal
+
+    # Final fallback for a standard ISO container number.
+    if not container["value"]:
+        container_match = re.search(
+            r"\b([A-Z]{4}\d{7})\b",
+            normalized
+        )
+        if container_match:
+            container = result(container_match.group(1), 0.90)
+
+    # 6. Gross weight and measurement
+    gross_weight = extract_bl_weight(normalized)
+    measurement = extract_bl_measurement(normalized)
+
+    # Retain fallback for the older tabular cargo layout.
+    if not gross_weight["value"] or not measurement["value"]:
+        weight_match = re.search(
+            r"(\d{2,3}(?:,\d{3})*(?:\.\d+)?)\s+"
+            r"(\d+\.\d+)\s*(?:\n|$)",
+            text
         )
 
-    # 7. Cargo description, including wrapped table lines
-    cargo = result()
+        if weight_match:
+            if not gross_weight["value"]:
+                gross_weight = result(
+                    weight_match.group(1) + " kg",
+                    0.90
+                )
+            if not measurement["value"]:
+                measurement = result(
+                    weight_match.group(2) + " CBM",
+                    0.90
+                )
 
-    cargo_match = re.search(
-        r"(Automotive\s+(?:accessories|spare\s+parts)\s*:\s*.+?)"
-        r"(?=\s+SHIPPED ON BOARD|\Z)",
-        text,
-        re.IGNORECASE | re.DOTALL
+    # 7. Cargo description
+    cargo = extract_labeled_value(
+        normalized,
+        [
+            "Cargo Description",
+            "Product Description",
+            "Description of Goods",
+            "Goods Description"
+        ]
     )
 
-    if cargo_match:
-        cargo_text = cargo_match.group(1)
-
-        cargo_text = re.sub(
-            r"\b\d{2,3}(?:,\d{3})*(?:\.\d+)?\s+"
-            r"\d+\.\d+\b",
-            "",
-            cargo_text
+    # Fallback for the older automotive cargo-table layout.
+    if not cargo["value"]:
+        cargo_match = re.search(
+            r"(Automotive\s+(?:accessories|spare\s+parts)\s*:\s*.+?)"
+            r"(?=\s+SHIPPED ON BOARD|\Z)",
+            text,
+            re.IGNORECASE | re.DOTALL
         )
 
-        cargo_text = re.sub(
-            r"RMP\s*/\s*HAMBURG",
-            "",
-            cargo_text,
-            flags=re.IGNORECASE
-        )
-
-        cargo_text = re.sub(
-            r"C/No\.?\s*\d+\s*-\s*\d+",
-            "",
-            cargo_text,
-            flags=re.IGNORECASE
-        )
-
-        cargo_text = re.sub(
-            r"\s+",
-            " ",
-            cargo_text
-        ).strip(" |")
-
-        cargo = result(cargo_text, 0.90)
+        if cargo_match:
+            cargo_text = cargo_match.group(1)
+            cargo_text = re.sub(
+                r"\b\d{2,3}(?:,\d{3})*(?:\.\d+)?\s+"
+                r"\d+\.\d+\b",
+                "",
+                cargo_text
+            )
+            cargo_text = re.sub(
+                r"RMP\s*/\s*HAMBURG",
+                "",
+                cargo_text,
+                flags=re.IGNORECASE
+            )
+            cargo_text = re.sub(
+                r"C/No\.?\s*\d+\s*-\s*\d+",
+                "",
+                cargo_text,
+                flags=re.IGNORECASE
+            )
+            cargo_text = re.sub(r"\s+", " ", cargo_text).strip(" |")
+            cargo = result(cargo_text, 0.90)
 
     # 8. Number of packages
-    package_match = re.search(
-        r"\b(\d+)\s+CTNS\b",
-        normalized,
-        re.IGNORECASE
-    )
+    packages = extract_package_count(normalized)
 
-    packages = (
-        result(package_match.group(1), 0.95)
-        if package_match
-        else extract_package_count(text)
-    )
+    if not packages["value"]:
+        package_match = re.search(
+            r"\b(\d+)\s+CTNS\b",
+            normalized,
+            re.IGNORECASE
+        )
+        if package_match:
+            packages = result(package_match.group(1), 0.95)
 
     return {
         "shipper": shipper,
