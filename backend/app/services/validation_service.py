@@ -7,16 +7,16 @@ def get_value(document, field):
     if not document or field not in document:
         return None
 
-    result = document[field]
+    value = document[field]
 
-    if isinstance(result, dict):
-        return result.get("value")
+    if isinstance(value, dict):
+        return value.get("value")
 
-    return result
+    return value
 
 
 def normalize_number(value):
-    """Extract a numeric value, e.g. '3,120 kg' becomes 3120."""
+    """Convert values such as '3,120 kg' into numbers."""
     if value is None:
         return None
 
@@ -27,7 +27,7 @@ def normalize_number(value):
 
 
 def normalize_text(value):
-    """Normalize text for basic comparison."""
+    """Normalize text before comparison."""
     if value is None:
         return None
 
@@ -38,8 +38,8 @@ def compare_numeric_field(
     field_name,
     documents,
     document_types,
-    tolerance=0,
-    severity="HIGH"
+    severity="HIGH",
+    tolerance=0
 ):
     values = {}
 
@@ -86,13 +86,16 @@ def compare_numeric_field(
 def compare_text_field(
     field_name,
     documents,
-    document_types,
+    field_mapping,
     severity="MEDIUM"
 ):
     values = {}
 
-    for doc_type in document_types:
-        value = get_value(documents.get(doc_type), field_name)
+    for doc_type, document_field in field_mapping.items():
+        value = get_value(
+            documents.get(doc_type),
+            document_field
+        )
 
         if value is not None and str(value).strip():
             values[doc_type] = str(value).strip()
@@ -107,7 +110,8 @@ def compare_text_field(
         }
 
     normalized = {
-        normalize_text(value) for value in values.values()
+        normalize_text(value)
+        for value in values.values()
     }
 
     if len(normalized) == 1:
@@ -128,81 +132,23 @@ def compare_text_field(
     }
 
 
-def compare_mapped_text_field(field_name, documents, field_mapping):
-    """
-    Compare different field names across documents.
-
-    Example:
-    Invoice buyer vs Bill of Lading consignee.
-    """
-    values = {}
-
-    for doc_type, document_field in field_mapping.items():
-        value = get_value(documents.get(doc_type), document_field)
-
-        if value is not None and str(value).strip():
-            values[doc_type] = str(value).strip()
-
-    if len(values) < 2:
-        return {
-            "field_name": field_name,
-            "status": "NOT_CHECKED",
-            "severity": "INFO",
-            "message": "Insufficient document values for comparison",
-            "compared_values": values
-        }
-
-    normalized = {
-        normalize_text(value) for value in values.values()
-    }
-
-    if len(normalized) == 1:
-        status = "MATCH"
-        severity = "INFO"
-        message = f"{field_name} matches across available documents"
-    else:
-        status = "MISMATCH"
-        severity = "MEDIUM"
-        message = f"{field_name} differs across documents"
-
-    return {
-        "field_name": field_name,
-        "status": status,
-        "severity": severity,
-        "message": message,
-        "compared_values": values
-    }
-
-
 def validate_shipment(documents):
     results = []
 
-    # 1. Gross weight: all three documents
+    # 1. Product Description
     results.append(
-        compare_numeric_field(
-            "gross_weight",
+        compare_text_field(
+            "product_description",
             documents,
-            [
-                "Commercial Invoice",
-                "Packing List",
-                "Bill of Lading"
-            ]
+            {
+                "Commercial Invoice": "product_description",
+                "Packing List": "product_description",
+                "Bill of Lading": "product_description"
+            }
         )
     )
 
-    # 2. Net weight: Invoice and Packing List
-    results.append(
-        compare_numeric_field(
-            "net_weight",
-            documents,
-            [
-                "Commercial Invoice",
-                "Packing List"
-            ]
-        )
-    )
-
-    # 3. Quantity: Invoice and Packing List
+    # 2. Quantity
     results.append(
         compare_numeric_field(
             "quantity",
@@ -215,38 +161,13 @@ def validate_shipment(documents):
         )
     )
 
-    # 4. Number of packages: Packing List and Bill of Lading
+    # 3. Gross Weight
     results.append(
         compare_numeric_field(
-            "number_of_packages",
-            documents,
-            [
-                "Packing List",
-                "Bill of Lading"
-            ],
-            severity="MEDIUM"
-        )
-    )
-
-    # 5. Product description: all three documents
-    results.append(
-        compare_text_field(
-            "product_description",
+            "gross_weight",
             documents,
             [
                 "Commercial Invoice",
-                "Packing List",
-                "Bill of Lading"
-            ]
-        )
-    )
-
-    # 6. Container number: Packing List and Bill of Lading
-    results.append(
-        compare_text_field(
-            "container_number",
-            documents,
-            [
                 "Packing List",
                 "Bill of Lading"
             ],
@@ -254,33 +175,22 @@ def validate_shipment(documents):
         )
     )
 
-    # 7. Vessel name: Packing List and Bill of Lading
+    # 4. Net Weight
     results.append(
-        compare_text_field(
-            "vessel_name",
+        compare_numeric_field(
+            "net_weight",
             documents,
             [
-                "Packing List",
-                "Bill of Lading"
-            ]
+                "Commercial Invoice",
+                "Packing List"
+            ],
+            severity="HIGH"
         )
     )
-    
-    # Compare voyage number between Packing List and Bill of Lading
+
+    # 5. Consignee / Buyer
     results.append(
         compare_text_field(
-        "voyage_number",
-        documents,
-        [
-            "Packing List",
-            "Bill of Lading"
-        ]
-    )
-)
-
-    # 8. Consignee: Invoice buyer vs Bill of Lading consignee
-    results.append(
-        compare_mapped_text_field(
             "consignee",
             documents,
             {
@@ -290,9 +200,9 @@ def validate_shipment(documents):
         )
     )
 
-    # 9. Shipper/Seller: Invoice seller vs Bill of Lading shipper
+    # 6. Shipper / Seller
     results.append(
-        compare_mapped_text_field(
+        compare_text_field(
             "shipper",
             documents,
             {

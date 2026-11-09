@@ -1,4 +1,3 @@
-
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 
@@ -48,10 +47,7 @@ function ShipmentDetails() {
     setReportLoading(true);
 
     try {
-      const response = await API.get(
-        `/shipments/${id}/report`
-      );
-
+      const response = await API.get(`/shipments/${id}/report`);
       setReport(response.data);
     } catch (err) {
       setReport(null);
@@ -83,9 +79,7 @@ function ShipmentDetails() {
       setError("");
 
       try {
-        const shipmentResponse = await API.get(
-          `/shipments/${id}`
-        );
+        const shipmentResponse = await API.get(`/shipments/${id}`);
 
         setShipment(shipmentResponse.data);
 
@@ -101,7 +95,6 @@ function ShipmentDetails() {
           );
 
           const review = reviewResponse.data;
-
           const documents = review.documents || [];
 
           const totalFields = documents.reduce(
@@ -177,16 +170,13 @@ function ShipmentDetails() {
         },
       }));
 
-      // Old processing results are no longer current
+      // Previous results are no longer current
       setResults(null);
       setReport(null);
 
       setSuccess(`${documentType} uploaded successfully!`);
 
-      // Refresh shipment status
-      const shipmentResponse = await API.get(
-        `/shipments/${id}`
-      );
+      const shipmentResponse = await API.get(`/shipments/${id}`);
 
       setShipment(shipmentResponse.data);
     } catch (err) {
@@ -220,9 +210,7 @@ function ShipmentDetails() {
       updateUploadedDocuments(documentsResponse.data);
 
       // Refresh shipment status and report
-      const shipmentResponse = await API.get(
-        `/shipments/${id}`
-      );
+      const shipmentResponse = await API.get(`/shipments/${id}`);
 
       setShipment(shipmentResponse.data);
 
@@ -340,6 +328,15 @@ function ShipmentDetails() {
     return "shipment-status pending";
   };
 
+  // Format field names
+  const formatFieldName = (fieldName) => {
+    if (!fieldName) return "Unknown Field";
+
+    return fieldName
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, (char) => char.toUpperCase());
+  };
+
   // Validation status styling
   const getValidationStatusClass = (status) => {
     if (status === "MATCH") {
@@ -364,6 +361,29 @@ function ShipmentDetails() {
     }
 
     return <Clock size={15} />;
+  };
+
+  // Severity styling
+  const getSeverityClass = (severity) => {
+    switch (severity?.toUpperCase()) {
+      case "HIGH":
+        return "severity-badge high";
+
+      case "MEDIUM":
+        return "severity-badge medium";
+
+      default:
+        return "severity-badge info";
+    }
+  };
+
+  // Format compared values
+  const formatComparedValue = (value) => {
+    if (value === null || value === undefined || value === "") {
+      return "Not available";
+    }
+
+    return String(value);
   };
 
   const allUploaded = documentTypes.every(
@@ -442,6 +462,7 @@ function ShipmentDetails() {
           <div className="details-heading-icon">
             <Package size={20} />
           </div>
+
           <div>
             <h2>Shipment Information</h2>
             <p>Basic shipment details</p>
@@ -579,6 +600,7 @@ function ShipmentDetails() {
       {/* Processing Results */}
       {results && (
         <>
+          {/* Processing Summary */}
           <div className="table-container results-section">
             <div className="details-section-heading">
               <div>
@@ -589,35 +611,83 @@ function ShipmentDetails() {
 
             <div className="result-stats">
               <div>
-                <strong>{results.documents_processed}</strong>
+                <strong>{results.documents_processed ?? 0}</strong>
                 <span>Documents Processed</span>
               </div>
 
               <div>
-                <strong>{results.fields_extracted}</strong>
+                <strong>{results.fields_extracted ?? 0}</strong>
                 <span>Fields Extracted</span>
               </div>
             </div>
 
+            {/* Validation Results */}
             <h3 className="validation-heading">
               Validation Results
             </h3>
 
             {results.validation_results?.length > 0 ? (
               <div className="validation-list">
+
                 {results.validation_results.map((item, index) => (
                   <div className="validation-item" key={index}>
+
+                    {/* Field information */}
                     <div className="validation-description">
-                      <strong>{item.field_name}</strong>
+                      <div className="validation-title-row">
+                        <strong>
+                          {formatFieldName(item.field_name)}
+                        </strong>
+
+                        <span
+                          className={getSeverityClass(item.severity)}
+                        >
+                          {item.severity || "INFO"}
+                        </span>
+                      </div>
+
                       <p>{item.message}</p>
+
+                      {/* Compared document values */}
+                      {item.compared_values &&
+                        Object.keys(item.compared_values).length > 0 && (
+                          <div className="compared-values">
+                            <strong className="compared-values-heading">
+                              Compared Values
+                            </strong>
+
+                            <div className="compared-values-grid">
+                              {Object.entries(
+                                item.compared_values
+                              ).map(([document, value]) => (
+                                <div
+                                  className="compared-value-card"
+                                  key={document}
+                                >
+                                  <span>{document}</span>
+
+                                  <strong>
+                                    {formatComparedValue(value)}
+                                  </strong>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
                     </div>
 
-                    <span className={getValidationStatusClass(item.status)}>
+                    {/* Validation status */}
+                    <span
+                      className={getValidationStatusClass(item.status)}
+                    >
                       {getValidationIcon(item.status)}
-                      {item.status}
+                      {item.status || "NOT_CHECKED"}
                     </span>
+
                   </div>
                 ))}
+
               </div>
             ) : (
               <p className="message">
