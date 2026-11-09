@@ -1,7 +1,6 @@
 
 import re
 
-
 def get_value(document, field):
     """Get a field value from an extracted document."""
     if not document or field not in document:
